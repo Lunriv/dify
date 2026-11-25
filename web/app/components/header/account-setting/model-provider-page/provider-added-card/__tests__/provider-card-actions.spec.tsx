@@ -23,10 +23,10 @@ const api = vi.hoisted(() => ({
   detail: vi.fn<typeof consoleClient.workspaces.current.plugin.list.installations.ids.post>(),
   uninstall: vi.fn<typeof consoleClient.workspaces.current.plugin.uninstall.post>(),
   upgrade: vi.fn<typeof consoleClient.workspaces.current.plugin.upgrade.marketplace.post>(),
-  tasks: vi.fn<typeof consoleClient.workspaces.current.plugin.tasks.get>(),
   versions: vi.fn<() => Promise<PluginVersionsResponse>>(),
   releases: vi.fn<typeof fetch>(),
   autoUpgrade: vi.fn<typeof consoleClient.workspaces.current.plugin.autoUpgrade.fetch.get>(),
+  tasks: vi.fn<typeof consoleClient.workspaces.current.plugin.tasks.get>(),
 }))
 // boundary: Stub Console transport responses while keeping generated queries and the upgrade flow real.
 vi.mock('@/service/console', async (importOriginal) => {
@@ -46,6 +46,7 @@ vi.mock('@/service/console', async (importOriginal) => {
         debug_permission: 'everyone',
       }),
       'workspaces.current.plugin.autoUpgrade.fetch.get': api.autoUpgrade,
+      // The upgrade dialog observes tasks through queryOptions, not consoleClient.
       'workspaces.current.plugin.tasks.get': api.tasks,
     }),
     consoleClient: withConsoleClientResponses(actual.consoleClient, {
@@ -55,18 +56,8 @@ vi.mock('@/service/console', async (importOriginal) => {
   }
 })
 vi.mock('@/service/marketplace', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/service/marketplace')>()
-  const { createTanstackQueryUtils } = await import('@orpc/tanstack-query')
-  return {
-    ...actual,
-    marketplaceQuery: createTanstackQueryUtils(
-      {
-        ...actual.marketplaceClient,
-        pluginVersions: api.versions,
-      },
-      { path: ['marketplace'] },
-    ),
-  }
+  const { withMarketplaceResponses } = await import('@/test/marketplace-service')
+  return withMarketplaceResponses(await importOriginal(), { pluginVersions: api.versions })
 })
 
 const identifier = (version: string) => `langgenius/plugin-entity:${version}@test`
@@ -131,6 +122,7 @@ const openActions = async (user: ReturnType<typeof userEvent.setup>) => {
   )
 }
 beforeEach(() => {
+  api.tasks.mockReset().mockResolvedValue({ tasks: [] })
   api.autoUpgrade.mockReset().mockResolvedValue({
     category: 'model',
     auto_upgrade: {
@@ -144,7 +136,6 @@ beforeEach(() => {
   api.detail.mockReset().mockResolvedValue({ plugins: [installed] })
   api.uninstall.mockReset().mockResolvedValue({ success: true })
   api.upgrade.mockReset().mockResolvedValue({ all_installed: true, task_id: '' })
-  api.tasks.mockReset().mockResolvedValue({ tasks: [] })
   api.versions.mockReset().mockResolvedValue({
     data: {
       versions: ['2.0.0', '1.0.0', '0.5.0'].map((version) => ({

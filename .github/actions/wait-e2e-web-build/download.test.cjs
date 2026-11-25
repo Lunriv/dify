@@ -3,15 +3,9 @@ const { access } = require('node:fs/promises')
 const { test } = require('node:test')
 const downloadWebBuild = require('./download.cjs')
 
-function fixture({
-  downloadFails = false,
-  producerFails = false,
-  artifactMissingOnce = false,
-  listFailure,
-} = {}) {
+function fixture({ downloadFailures = 0, producerFails = false, listFailure } = {}) {
   const calls = []
   const sleeps = []
-  let artifactLookups = 0
   const listLookups = { jobs: 0, artifacts: 0 }
   const env = {
     GITHUB_REPOSITORY: 'owner/repo',
@@ -23,7 +17,10 @@ function fixture({
     calls.push({ command, args })
     if (command === 'tar') return { stdout: '' }
     if (args[0] === 'run') {
-      if (downloadFails) throw new Error('artifact download failed')
+      if (downloadFailures > 0) {
+        downloadFailures--
+        throw new Error('artifact download failed')
+      }
       return { stdout: '' }
     }
     const kind = args[1].includes('/jobs?')
@@ -36,7 +33,7 @@ function fixture({
       if (listFailure?.kind === kind && listLookups[kind] <= listFailure.attempts) {
         if (listFailure.mode === 'json') return { stdout: `[{"${kind}":` }
         // Match the CI failure: gh pagination exits 1 with partial stdout,
-        // before our own JSON.parse or any artifact metadata/download request.
+        // before our own JSON.parse or the archive download.
         throw Object.assign(new Error('unexpected end of JSON input'), {
           code: 1,
           stdout: '[]',
@@ -84,10 +81,7 @@ function fixture({
         ]),
       }
     }
-    assert.equal(args[1], 'repos/owner/repo/actions/artifacts/42')
-    artifactLookups++
-    if (artifactMissingOnce && artifactLookups === 1) throw new Error('gh: Not Found (HTTP 404)')
-    return { stdout: JSON.stringify({ name: 'core-e2e-web-build-2' }) }
+    throw new Error(`Unexpected command: ${command} ${args.join(' ')}`)
   }
   const sleep = async (ms) => {
     sleeps.push(ms)
@@ -95,9 +89,17 @@ function fixture({
   return { calls, sleeps, options: { env, execute, webDir: '/test/web', sleep } }
 }
 
-test('downloads the producer-selected artifact on consumer-only reruns, including paginated results', async () => {
+test('downloads the producer-selected artifact on consumer-only reruns without a second metadata lookup', async () => {
   const { calls, options } = fixture()
-  await downloadWebBuild(options)
+  await downloadWebBuild({
+    ...options,
+    async execute(command, args) {
+      if (args[0] === 'api' && args[1].endsWith('/artifacts/42')) {
+        throw new Error('gh: Not Found (HTTP 404)')
+      }
+      return options.execute(command, args)
+    },
+  })
   assert.match(calls[0].args[1], /runs\/123\/attempts\/4\/jobs/)
   const download = calls.find(({ args }) => args[0] === 'run')
   assert.deepEqual(download.args.slice(0, 7), [
@@ -115,10 +117,11 @@ test('downloads the producer-selected artifact on consumer-only reruns, includin
   await assert.rejects(access(download.args.at(-1)), { code: 'ENOENT' })
 })
 
-test('retries an artifact that is listed before its endpoint is readable', async () => {
-  const { calls, sleeps, options } = fixture({ artifactMissingOnce: true })
+test('retries a listed artifact whose archive is temporarily unreadable', async () => {
+  const { calls, sleeps, options } = fixture({ downloadFailures: 1 })
   await downloadWebBuild(options)
   assert.deepEqual(sleeps, [5_000])
+  assert.equal(calls.filter(({ args }) => args[0] === 'run').length, 2)
   assert.equal(calls.at(-1).command, 'tar')
 })
 
@@ -148,7 +151,7 @@ for (const kind of ['jobs', 'artifacts']) {
 }
 
 test('does not extract a failed download and removes its temporary directory', async () => {
-  const { calls, sleeps, options } = fixture({ downloadFails: true })
+  const { calls, sleeps, options } = fixture({ downloadFailures: 3 })
   await assert.rejects(downloadWebBuild(options), /artifact download failed/)
   assert.deepEqual(sleeps, [5_000, 10_000])
   assert.equal(calls.filter(({ args }) => args[0] === 'run').length, 3)
