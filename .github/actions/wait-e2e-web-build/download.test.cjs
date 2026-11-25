@@ -143,9 +143,18 @@ for (const kind of ['jobs', 'artifacts']) {
       assert.deepEqual(sleeps, [5_000, 10_000])
       const reads = calls.filter(({ args }) => args[0] === 'api' && args[1].includes(`/${kind}?`))
       assert.equal(reads.length, 3)
-      assert.equal(calls.some(({ args }) => args[0] === 'run'), false)
-      assert.equal(calls.some(({ command }) => command === 'tar'), false)
-      assert.equal(calls.some(({ args }) => args[1] === 'repos/owner/repo/actions/artifacts/42'), false)
+      assert.equal(
+        calls.some(({ args }) => args[0] === 'run'),
+        false,
+      )
+      assert.equal(
+        calls.some(({ command }) => command === 'tar'),
+        false,
+      )
+      assert.equal(
+        calls.some(({ args }) => args[1] === 'repos/owner/repo/actions/artifacts/42'),
+        false,
+      )
     })
   }
 }
