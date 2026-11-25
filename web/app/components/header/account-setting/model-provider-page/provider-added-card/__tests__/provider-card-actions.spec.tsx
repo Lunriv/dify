@@ -23,10 +23,12 @@ const api = vi.hoisted(() => ({
   detail: vi.fn<typeof consoleClient.workspaces.current.plugin.list.installations.ids.post>(),
   uninstall: vi.fn<typeof consoleClient.workspaces.current.plugin.uninstall.post>(),
   upgrade: vi.fn<typeof consoleClient.workspaces.current.plugin.upgrade.marketplace.post>(),
+  tasks: vi.fn<typeof consoleClient.workspaces.current.plugin.tasks.get>(),
   versions: vi.fn<() => Promise<PluginVersionsResponse>>(),
   releases: vi.fn<typeof fetch>(),
   autoUpgrade: vi.fn<typeof consoleClient.workspaces.current.plugin.autoUpgrade.fetch.get>(),
 }))
+// boundary: Stub Console transport responses while keeping generated queries and the upgrade flow real.
 vi.mock('@/service/console', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/service/console')>()
   const { withConsoleResponses, withConsoleClientResponses } =
@@ -44,11 +46,11 @@ vi.mock('@/service/console', async (importOriginal) => {
         debug_permission: 'everyone',
       }),
       'workspaces.current.plugin.autoUpgrade.fetch.get': api.autoUpgrade,
+      'workspaces.current.plugin.tasks.get': api.tasks,
     }),
     consoleClient: withConsoleClientResponses(actual.consoleClient, {
       'workspaces.current.plugin.uninstall.post': api.uninstall,
       'workspaces.current.plugin.upgrade.marketplace.post': api.upgrade,
-      'workspaces.current.plugin.tasks.get': async () => ({ tasks: [] }),
     }),
   }
 })
@@ -142,6 +144,7 @@ beforeEach(() => {
   api.detail.mockReset().mockResolvedValue({ plugins: [installed] })
   api.uninstall.mockReset().mockResolvedValue({ success: true })
   api.upgrade.mockReset().mockResolvedValue({ all_installed: true, task_id: '' })
+  api.tasks.mockReset().mockResolvedValue({ tasks: [] })
   api.versions.mockReset().mockResolvedValue({
     data: {
       versions: ['2.0.0', '1.0.0', '0.5.0'].map((version) => ({
@@ -244,6 +247,9 @@ it('uses the latest summary package when the loaded detail still describes the i
     await screen.findByRole('button', { name: 'plugin.detailPanel.operation.update' }),
   )
   const dialog = await screen.findByRole('dialog', { name: 'plugin.upgrade.title' })
+  await waitFor(() =>
+    expect(api.tasks).toHaveBeenCalledExactlyOnceWith({ query: { page: 1, page_size: 100 } }),
+  )
   await user.click(within(dialog).getByRole('button', { name: 'plugin.upgrade.upgrade' }))
   await waitFor(() => expect(onUpdate).toHaveBeenCalledOnce())
   expect(api.upgrade).toHaveBeenCalledExactlyOnceWith({

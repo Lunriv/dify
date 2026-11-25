@@ -35,27 +35,29 @@ async function downloadWebBuild({
       timeout,
       maxBuffer: 32 * 1024 * 1024,
     })
-  const api = async (endpoint, paginate = false) => {
-    const { stdout } = await run('gh', [
-      'api',
-      endpoint,
-      ...(paginate ? ['--paginate', '--slurp'] : []),
-    ])
-    return JSON.parse(stdout)
-  }
   // An artifact can be listed for the run before its own endpoint and download are
-  // readable (seen as a 404 right after upload), so retry those reads briefly.
-  const withRetry = async (operation) => {
+  // readable (seen as a 404 right after upload). Paginated list reads can also
+  // fail on truncated GitHub responses, so retry process and JSON errors briefly.
+  const withRetry = async (label, operation) => {
     for (let attempt = 1; ; attempt++) {
       try {
         return await operation()
       } catch (error) {
         if (attempt >= 3) throw error
-        console.log(`Web build artifact not readable yet (attempt ${attempt}): ${error.message}`)
+        console.log(`Web build ${label} failed (attempt ${attempt}); retrying: ${error.message}`)
         await sleep(attempt * 5_000)
       }
     }
   }
+  const api = (endpoint, label, paginate = false) =>
+    withRetry(label, async () => {
+      const { stdout } = await run('gh', [
+        'api',
+        endpoint,
+        ...(paginate ? ['--paginate', '--slurp'] : []),
+      ])
+      return JSON.parse(stdout)
+    })
   const prefix = `repos/${repository}/actions`
   let summary = ''
   const artifactId = await waitForBuild({
@@ -68,7 +70,7 @@ async function downloadWebBuild({
           kind === 'jobs'
             ? `${prefix}/runs/${runId}/attempts/${runAttempt}/jobs?per_page=100`
             : `${prefix}/runs/${runId}/artifacts?per_page=100`
-        const pages = await api(endpoint, true)
+        const pages = await api(endpoint, `${kind} list`, true)
         return pages.flatMap((page) => page[kind])
       },
     },
@@ -92,12 +94,12 @@ async function downloadWebBuild({
     runAttempt,
   })
 
-  const artifact = await withRetry(() => api(`${prefix}/artifacts/${artifactId}`))
+  const artifact = await api(`${prefix}/artifacts/${artifactId}`, 'artifact metadata')
   const directory = await mkdtemp(path.join(os.tmpdir(), 'dify-e2e-web-build-'))
   try {
     // Artifact names are immutable within a run. Use the name selected by wait.cjs,
     // including its matching upload timestamp when only consumer jobs are rerun.
-    await withRetry(() =>
+    await withRetry('artifact download', () =>
       run(
         'gh',
         [
