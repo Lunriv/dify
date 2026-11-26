@@ -20,10 +20,18 @@ from core.app.entities.app_invoke_entities import DIFY_RUN_CONTEXT_KEY, DifyRunC
 from core.app.file_access import FileAccessScope, bind_file_access_scope, grant_retriever_segment_access
 from core.app.llm.model_access import DifyCredentialsProvider, DifyModelFactory
 from core.callback_handler.workflow_tool_callback_handler import DifyWorkflowCallbackHandler
+from core.entities.provider_entities import (
+    CustomProviderConfiguration,
+    ProviderQuotaType,
+    QuotaConfiguration,
+    QuotaUnit,
+    SystemConfiguration,
+)
+from core.errors.error import InsufficientHostedCreditsError
 from core.helper.ssrf_proxy import graphon_ssrf_proxy
 from core.llm_generator.output_parser.errors import OutputParserError
 from core.llm_generator.output_parser.structured_output import _parse_structured_output
-from core.model_manager import QuotaManagedModelInstance
+from core.model_manager import HostedCreditFallbackModelInstance, QuotaManagedModelInstance
 from core.plugin.impl.exc import PluginDaemonClientSideError, PluginInvokeError, PluginLLMPollingUnsupportedError
 from core.plugin.impl.model import PluginModelClient
 from core.plugin.impl.model_runtime import PluginModelRuntime
@@ -94,6 +102,7 @@ from models.base import TypeBase
 from models.dataset import SegmentAttachmentBinding
 from models.enums import CreatorUserRole
 from models.model import StorageType, UploadFile
+from models.provider import ProviderType
 from models.tools import ToolFile
 from services.moderation_invocation_errors import (
     ModerationRejectedInvocationError,
@@ -1909,6 +1918,260 @@ class TestNodeRuntimeCases:
                 stop=None,
                 json_schema=None,
             )
+
+    @staticmethod
+    def test_dify_prepared_polling_llm_falls_back_to_custom_credentials_when_hosted_credits_insufficient() -> None:
+        config = make_model_config(provider="langgenius/openai/openai", model="gpt-4o-mini", mode="chat")
+        bundle = config.provider_model_bundle
+        configuration = bundle.configuration
+        configuration.provider.models = [config.model_schema]
+        configuration.preferred_provider_type = ProviderType.SYSTEM
+        configuration.using_provider_type = ProviderType.SYSTEM
+        configuration.system_configuration = SystemConfiguration(
+            enabled=True,
+            current_quota_type=ProviderQuotaType.TRIAL,
+            credentials={"api_key": "hosted"},
+            quota_configurations=[
+                QuotaConfiguration(
+                    quota_type=ProviderQuotaType.TRIAL,
+                    quota_unit=QuotaUnit.CREDITS,
+                    quota_limit=100,
+                    quota_used=99,
+                    is_valid=True,
+                )
+            ],
+        )
+        configuration.custom_configuration.provider = CustomProviderConfiguration(credentials={"api_key": "custom"})
+
+        running_result = LLMPollingResult(
+            status=LLMPollingStatus.RUNNING,
+            plugin_state={"task_id": "poll-1"},
+        )
+        usage = node_runtime.LLMUsage.empty_usage().model_copy(update={"total_tokens": 5})
+        succeeded_result = LLMPollingResult(
+            status=LLMPollingStatus.SUCCEEDED,
+            result=node_runtime.LLMResult(
+                model="gpt-4o-mini",
+                prompt_messages=[],
+                message=_node_runtime_AssistantPromptMessage(content="done"),
+                usage=usage,
+            ),
+        )
+        assert isinstance(bundle.model_type_instance, LargeLanguageModel)
+        plugin_runtime = bundle.model_type_instance.model_runtime
+        assert isinstance(plugin_runtime, PluginModelRuntime)
+        configuration.bind_model_runtime(plugin_runtime)
+        plugin_runtime.start_llm_polling = Mock(return_value=running_result)  # type: ignore[method-assign]
+        plugin_runtime.check_llm_polling = Mock(return_value=succeeded_result)  # type: ignore[method-assign]
+
+        reservation = MagicMock()
+        model_instance = HostedCreditFallbackModelInstance(
+            bundle,
+            "gpt-4o-mini",
+            {"api_key": "hosted"},
+        )
+        prepared = DifyPreparedPollingLLM(model_instance)
+
+        with patch.object(
+            model_instance,
+            "_reserve_model_quota",
+            side_effect=[InsufficientHostedCreditsError("credits exhausted"), reservation],
+        ):
+            assert (
+                prepared.start_llm_polling(
+                    prompt_messages=[],
+                    model_parameters={},
+                    tools=None,
+                    stop=None,
+                    json_schema=None,
+                )
+                == running_result
+            )
+            # Rotating the configured custom key mid-run must not change the key used to poll the started task.
+            configuration.custom_configuration.provider = CustomProviderConfiguration(
+                credentials={"api_key": "custom-rotated"}
+            )
+            assert prepared.check_llm_polling(plugin_state={"task_id": "poll-1"}) == succeeded_result
+
+            reservation.commit.assert_not_called()
+            reservation.release.assert_not_called()
+            assert plugin_runtime.start_llm_polling.call_args.kwargs["credentials"] == {"api_key": "custom"}
+            assert plugin_runtime.check_llm_polling.call_args.kwargs["credentials"] == {"api_key": "custom"}
+            assert model_instance.credentials == {"api_key": "hosted"}
+
+            assert (
+                prepared.start_llm_polling(
+                    prompt_messages=[],
+                    model_parameters={},
+                    tools=None,
+                    stop=None,
+                    json_schema=None,
+                )
+                == running_result
+            )
+            assert prepared.check_llm_polling(plugin_state={"task_id": "poll-2"}) == succeeded_result
+
+        assert plugin_runtime.start_llm_polling.call_args.kwargs["credentials"] == {"api_key": "hosted"}
+        assert plugin_runtime.check_llm_polling.call_args.kwargs["credentials"] == {"api_key": "hosted"}
+        reservation.commit.assert_called_once_with(usage)
+        reservation.release.assert_not_called()
+
+    @staticmethod
+    def test_dify_prepared_polling_llm_propagates_hosted_credit_error_without_custom_credentials() -> None:
+        config = make_model_config(provider="langgenius/openai/openai", model="gpt-4o-mini", mode="chat")
+        bundle = config.provider_model_bundle
+        configuration = bundle.configuration
+        configuration.provider.models = [config.model_schema]
+        configuration.preferred_provider_type = ProviderType.SYSTEM
+        configuration.using_provider_type = ProviderType.SYSTEM
+        configuration.system_configuration = SystemConfiguration(
+            enabled=True,
+            current_quota_type=ProviderQuotaType.TRIAL,
+            credentials={"api_key": "hosted"},
+            quota_configurations=[
+                QuotaConfiguration(
+                    quota_type=ProviderQuotaType.TRIAL,
+                    quota_unit=QuotaUnit.CREDITS,
+                    quota_limit=100,
+                    quota_used=100,
+                    is_valid=True,
+                )
+            ],
+        )
+        assert isinstance(bundle.model_type_instance, LargeLanguageModel)
+        plugin_runtime = bundle.model_type_instance.model_runtime
+        assert isinstance(plugin_runtime, PluginModelRuntime)
+        plugin_runtime.start_llm_polling = Mock()  # type: ignore[method-assign]
+
+        model_instance = HostedCreditFallbackModelInstance(
+            bundle,
+            "gpt-4o-mini",
+            {"api_key": "hosted"},
+        )
+        prepared = DifyPreparedPollingLLM(model_instance)
+
+        with (
+            patch.object(
+                model_instance,
+                "_reserve_model_quota",
+                side_effect=InsufficientHostedCreditsError("credits exhausted"),
+            ),
+            pytest.raises(InsufficientHostedCreditsError, match="credits exhausted"),
+        ):
+            prepared.start_llm_polling(
+                prompt_messages=[],
+                model_parameters={},
+                tools=None,
+                stop=None,
+                json_schema=None,
+            )
+
+        plugin_runtime.start_llm_polling.assert_not_called()
+
+    @staticmethod
+    def test_dify_prepared_polling_llm_clears_custom_fallback_on_failure_and_finalize() -> None:
+        config = make_model_config(provider="langgenius/openai/openai", model="gpt-4o-mini", mode="chat")
+        bundle = config.provider_model_bundle
+        configuration = bundle.configuration
+        configuration.provider.models = [config.model_schema]
+        configuration.preferred_provider_type = ProviderType.SYSTEM
+        configuration.using_provider_type = ProviderType.SYSTEM
+        configuration.system_configuration = SystemConfiguration(
+            enabled=True,
+            current_quota_type=ProviderQuotaType.TRIAL,
+            credentials={"api_key": "hosted"},
+            quota_configurations=[
+                QuotaConfiguration(
+                    quota_type=ProviderQuotaType.TRIAL,
+                    quota_unit=QuotaUnit.CREDITS,
+                    quota_limit=100,
+                    quota_used=99,
+                    is_valid=True,
+                )
+            ],
+        )
+        configuration.custom_configuration.provider = CustomProviderConfiguration(credentials={"api_key": "custom"})
+
+        running_result = LLMPollingResult(
+            status=LLMPollingStatus.RUNNING,
+            plugin_state={"task_id": "poll-1"},
+        )
+        usage = node_runtime.LLMUsage.empty_usage().model_copy(update={"total_tokens": 5})
+        succeeded_result = LLMPollingResult(
+            status=LLMPollingStatus.SUCCEEDED,
+            result=node_runtime.LLMResult(
+                model="gpt-4o-mini",
+                prompt_messages=[],
+                message=_node_runtime_AssistantPromptMessage(content="done"),
+                usage=usage,
+            ),
+        )
+        assert isinstance(bundle.model_type_instance, LargeLanguageModel)
+        plugin_runtime = bundle.model_type_instance.model_runtime
+        assert isinstance(plugin_runtime, PluginModelRuntime)
+        configuration.bind_model_runtime(plugin_runtime)
+        plugin_runtime.start_llm_polling = Mock(return_value=running_result)  # type: ignore[method-assign]
+        plugin_runtime.check_llm_polling = Mock(  # type: ignore[method-assign]
+            side_effect=[RuntimeError("polling failed"), succeeded_result]
+        )
+
+        reservation = MagicMock()
+        model_instance = HostedCreditFallbackModelInstance(
+            bundle,
+            "gpt-4o-mini",
+            {"api_key": "hosted"},
+        )
+        prepared = DifyPreparedPollingLLM(model_instance)
+
+        with patch.object(
+            model_instance,
+            "_reserve_model_quota",
+            side_effect=[
+                InsufficientHostedCreditsError("credits exhausted"),
+                InsufficientHostedCreditsError("credits exhausted"),
+                reservation,
+            ],
+        ):
+            # 1. check_llm_polling failure during a custom fallback run clears the cached fallback instance.
+            prepared.start_llm_polling(
+                prompt_messages=[],
+                model_parameters={},
+                tools=None,
+                stop=None,
+                json_schema=None,
+            )
+            with pytest.raises(RuntimeError, match="polling failed"):
+                prepared.check_llm_polling(plugin_state={"task_id": "poll-1"})
+            assert prepared._active_polling_model_instance is None
+
+            # 2. Explicit finalize_llm_polling() during a RUNNING fallback run also clears the cached instance.
+            prepared.start_llm_polling(
+                prompt_messages=[],
+                model_parameters={},
+                tools=None,
+                stop=None,
+                json_schema=None,
+            )
+            assert prepared._active_polling_model_instance is not None
+            prepared.finalize_llm_polling()
+            assert prepared._active_polling_model_instance is None
+            reservation.commit.assert_not_called()
+            reservation.release.assert_not_called()
+
+            # 3. A subsequent run when hosted credits are available uses hosted credentials and commits quota.
+            prepared.start_llm_polling(
+                prompt_messages=[],
+                model_parameters={},
+                tools=None,
+                stop=None,
+                json_schema=None,
+            )
+            assert prepared.check_llm_polling(plugin_state={"task_id": "poll-2"}) == succeeded_result
+
+        assert plugin_runtime.start_llm_polling.call_args.kwargs["credentials"] == {"api_key": "hosted"}
+        assert plugin_runtime.check_llm_polling.call_args.kwargs["credentials"] == {"api_key": "hosted"}
+        reservation.commit.assert_called_once_with(usage)
+        reservation.release.assert_not_called()
 
     @staticmethod
     def test_dify_prompt_message_serializer_delegates(monkeypatch: pytest.MonkeyPatch) -> None:

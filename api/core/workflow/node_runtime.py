@@ -121,6 +121,7 @@ class PollingLLMRuntimeProtocol(Protocol):
 
 if TYPE_CHECKING:
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.app.llm.quota import ModelQuotaReservation
     from core.tools.__base.tool import Tool
     from core.tools.entities.tool_entities import ToolInvokeMessage as CoreToolInvokeMessage
     from core.tools.workflow_as_tool.tool import WorkflowTool
@@ -341,12 +342,14 @@ class DifyPreparedPollingLLM(DifyPreparedLLM, LLMPollingCapableProtocol):
         super().__init__(model_instance, request_metadata=request_metadata)
         model_type_instance = cast(LargeLanguageModel, model_instance.model_type_instance)
         self._polling_runtime = cast(PollingLLMRuntimeProtocol, model_type_instance.model_runtime)
-        self._polling_quota_reservation = None
+        self._polling_quota_reservation: ModelQuotaReservation | None = None
+        self._active_polling_model_instance: ModelInstance | None = None
 
     @override
     def finalize_llm_polling(self) -> None:
         reservation = self._polling_quota_reservation
         self._polling_quota_reservation = None
+        self._active_polling_model_instance = None
         if reservation is not None:
             QuotaManagedModelInstance.release_quota_safely(reservation)
 
@@ -358,6 +361,7 @@ class DifyPreparedPollingLLM(DifyPreparedLLM, LLMPollingCapableProtocol):
         use the same policy, and backend failures propagate without approval.
         """
         reservation = self._polling_quota_reservation
+        active_model_instance = self._active_polling_model_instance or self._model_instance
         if polling_result.status == LLMPollingStatus.RUNNING:
             return polling_result
 
@@ -367,8 +371,8 @@ class DifyPreparedPollingLLM(DifyPreparedLLM, LLMPollingCapableProtocol):
                     raise ValueError("A successful LLM polling result must include a model result.")
                 if reservation is not None:
                     reservation.commit(polling_result.result.usage)
-                if self._model_instance.moderation is not None:
-                    self._model_instance.moderation.check_result(polling_result.result)
+                if active_model_instance.moderation is not None:
+                    active_model_instance.moderation.check_result(polling_result.result)
             elif reservation is not None:
                 reservation.release()
         except Exception:
@@ -377,6 +381,7 @@ class DifyPreparedPollingLLM(DifyPreparedLLM, LLMPollingCapableProtocol):
             raise
         finally:
             self._polling_quota_reservation = None
+            self._active_polling_model_instance = None
 
         return polling_result
 
@@ -402,13 +407,18 @@ class DifyPreparedPollingLLM(DifyPreparedLLM, LLMPollingCapableProtocol):
             self._model_instance.moderation.check_inputs(prompt_messages)
 
         if isinstance(self._model_instance, QuotaManagedModelInstance):
-            self._polling_quota_reservation = self._model_instance._reserve_quota_for_request(self._request_metadata)
+            admission = self._model_instance._prepare_invocation(self._request_metadata)
+            if isinstance(admission, ModelInstance):
+                self._active_polling_model_instance = admission
+            else:
+                self._polling_quota_reservation = admission
 
+        active_model_instance = self._active_polling_model_instance or self._model_instance
         try:
             polling_result = self._polling_runtime.start_llm_polling(
                 provider=self.provider,
                 model=self.model_name,
-                credentials=self._model_instance.credentials,
+                credentials=active_model_instance.credentials,
                 prompt_messages=prompt_messages,
                 model_parameters=dict(model_parameters),
                 tools=tools,
@@ -432,11 +442,12 @@ class DifyPreparedPollingLLM(DifyPreparedLLM, LLMPollingCapableProtocol):
         propagate, releasing only outstanding quota rather than refunding a
         successful model invocation whose output was rejected.
         """
+        active_model_instance = self._active_polling_model_instance or self._model_instance
         try:
             polling_result = self._polling_runtime.check_llm_polling(
                 provider=self.provider,
                 model=self.model_name,
-                credentials=self._model_instance.credentials,
+                credentials=active_model_instance.credentials,
                 plugin_state=dict(plugin_state),
             )
             return self._finalize_polling_result(polling_result)
