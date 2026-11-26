@@ -34,8 +34,14 @@ describe('skill metadata policy', () => {
   it('keeps the cached files and refetches the detail after a metadata save', async () => {
     const { client, context, invalidatedKeys } = setup()
     const detailKey = skills.bySkillId.get.queryKey({ input: { params } })
+    const infiniteListKey = skills.get.infiniteOptions({
+      input: (pageParam: number) => ({ query: { page: pageParam, tag: ['a'] } }),
+      initialPageParam: 1,
+      getNextPageParam: () => undefined,
+    }).queryKey
     const files = [{ path: 'SKILL.md' }]
     client.setQueryData(detailKey, { ...detail, display_name: 'Before', files } as never)
+    client.setQueryData(infiniteListKey, { pages: [], pageParams: [1] } as never)
 
     await skills.bySkillId.patch.mutationOptions().onSuccess!(
       detail,
@@ -51,8 +57,10 @@ describe('skill metadata policy', () => {
         detailKey,
         skills.bySkillId.versions.get.key({ input: { params } }),
         skills.get.key({ type: 'query' }),
+        skills.get.key({ type: 'infinite' }),
       ]),
     )
+    expect(client.getQueryState(infiniteListKey)?.isInvalidated).toBe(true)
     expect(invalidatedKeys()).not.toContainEqual(skills.tags.get.key())
   })
 

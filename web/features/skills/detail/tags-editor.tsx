@@ -21,6 +21,7 @@ import { isCreateTagOption } from '@/features/tag-management/tag-option'
 import { TagSearchContentView } from '@/features/tag-management/tag-search-content'
 import { consoleQuery } from '@/service/console'
 import { getErrorMessage } from '@/utils/error-message'
+import { invalidateSkillListQueries } from '../list/query'
 import { invalidateSkillDetail } from './cache'
 import { runSkillDraftMutation } from './mutations'
 
@@ -255,12 +256,7 @@ export function SkillTagsEditor({
         onClose={() => setShowTagManagement(false)}
         onTagsChange={() => {
           invalidateSkillDetail(queryClient, skillId)
-          void queryClient.invalidateQueries({
-            queryKey: consoleQuery.workspaces.current.skills.tags.get.key({ type: 'query' }),
-          })
-          void queryClient.invalidateQueries({
-            queryKey: consoleQuery.workspaces.current.skills.get.key({ type: 'query' }),
-          })
+          invalidateSkillListQueries(queryClient)
         }}
       />
     </>

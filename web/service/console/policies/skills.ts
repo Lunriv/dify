@@ -70,6 +70,7 @@ export function skillPolicies(
                 consoleQuery.workspaces.current.skills.bySkillId.versions.get.key({ input }),
                 consoleQuery.workspaces.current.agents.byAgentId.skills.get.key(),
                 consoleQuery.workspaces.current.skills.get.key({ type: 'query' }),
+                consoleQuery.workspaces.current.skills.get.key({ type: 'infinite' }),
                 ...(body.tags ? [consoleQuery.workspaces.current.skills.tags.get.key()] : []),
               ])
             },
