@@ -15,22 +15,24 @@ export const usePluginDependencies = () => {
     }),
   )
   const { mutateAsync: checkPipelineDependencies } = useMutation(
-    consoleQuery.rag.pipelines.imports.byPipelineId.checkDependencies.get.mutationOptions(),
+    consoleQuery.rag.pipelines.imports.byPipelineId.checkDependencies.get.mutationOptions({
+      meta: { errorToast: false },
+    }),
   )
 
   const handleCheckPluginDependencies = useCallback(
     async (id: string, isPipeline = false) => {
       const { setDependencies } = usePluginDependenciesStore.getState()
-      if (isPipeline) {
-        setDependencies(
-          selectPipelineDependencies(
-            await checkPipelineDependencies({ params: { pipeline_id: id } }),
-          ),
-        )
-        return true
-      }
-
       try {
+        if (isPipeline) {
+          setDependencies(
+            selectPipelineDependencies(
+              await checkPipelineDependencies({ params: { pipeline_id: id } }),
+            ),
+          )
+          return true
+        }
+
         const { leaked_dependencies } = await checkWorkflowDependencies({ params: { app_id: id } })
         setDependencies(
           (leaked_dependencies ?? []).map((dependency) => ({

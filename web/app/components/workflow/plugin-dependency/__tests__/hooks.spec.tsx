@@ -1,7 +1,8 @@
 import type { CheckDependenciesResult } from '@dify/contracts/api/console/apps/types.gen'
 import { act } from '@testing-library/react'
+import { createErrorToastCaches } from '@/app/query-error-toast'
 import { createHttpError } from '@/service/http-error'
-import { renderHookWithConsoleQuery } from '@/test/console/query-data'
+import { createConsoleQueryClient, renderHookWithConsoleQuery } from '@/test/console/query-data'
 import { usePluginDependencies } from '../hooks'
 import { useStore } from '../store'
 
@@ -16,6 +17,7 @@ vi.mock('@/app/notifications', () => ({ toast: { error: mocks.error } }))
 describe('usePluginDependencies', () => {
   beforeEach(() => {
     mocks.request.mockReset()
+    mocks.error.mockReset()
     useStore.getState().setDependencies([])
   })
 
@@ -56,26 +58,53 @@ describe('usePluginDependencies', () => {
   )
 
   it.each([
-    [new TypeError('Network unavailable'), 'Network unavailable'],
-    [
-      createHttpError(new Response(null, { status: 503 }), {
+    {
+      resource: 'app',
+      isPipeline: false,
+      error: new TypeError('Network unavailable'),
+      description: 'Network unavailable',
+    },
+    {
+      resource: 'app',
+      isPipeline: false,
+      error: createHttpError(new Response(null, { status: 503 }), {
         message: 'Dependency check unavailable',
       }),
-      'Dependency check unavailable',
-    ],
-  ])('reports app dependency errors and clears stale dependencies', async (error, description) => {
-    useStore.getState().setDependencies([
-      {
-        type: 'marketplace',
-        value: { marketplace_plugin_unique_identifier: 'previous-app-plugin' },
-      },
-    ])
-    mocks.request.mockRejectedValue(error)
-    const { result } = renderHookWithConsoleQuery(usePluginDependencies)
-    await act(async () =>
-      expect(await result.current.handleCheckPluginDependencies('app-1')).toBe(false),
-    )
-    expect(mocks.error).toHaveBeenCalledExactlyOnceWith('common.error', { description })
-    expect(useStore.getState().dependencies).toEqual([])
-  })
+      description: 'Dependency check unavailable',
+    },
+    {
+      resource: 'pipeline',
+      isPipeline: true,
+      error: new TypeError('Network unavailable'),
+      description: 'Network unavailable',
+    },
+    {
+      resource: 'pipeline',
+      isPipeline: true,
+      error: createHttpError(new Response(null, { status: 503 }), {
+        message: 'Dependency check unavailable',
+      }),
+      description: 'Dependency check unavailable',
+    },
+  ])(
+    'reports $resource dependency errors once and clears stale dependencies ($description)',
+    async ({ isPipeline, error, description }) => {
+      useStore.getState().setDependencies([
+        {
+          type: 'marketplace',
+          value: { marketplace_plugin_unique_identifier: 'previous-app-plugin' },
+        },
+      ])
+      mocks.request.mockRejectedValue(error)
+      const queryClient = createConsoleQueryClient({ caches: createErrorToastCaches() })
+      const { result } = renderHookWithConsoleQuery(usePluginDependencies, { queryClient })
+      await act(async () =>
+        expect(await result.current.handleCheckPluginDependencies('resource-1', isPipeline)).toBe(
+          false,
+        ),
+      )
+      expect(mocks.error).toHaveBeenCalledExactlyOnceWith('common.error', { description })
+      expect(useStore.getState().dependencies).toEqual([])
+    },
+  )
 })
