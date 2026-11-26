@@ -15,6 +15,7 @@ import {
 } from '@/test/console/model-provider'
 import {
   createConsoleQueryClient,
+  createFeaturesFixture,
   renderWithConsoleQuery,
   seedFeatures,
 } from '@/test/console/query-data'
@@ -27,6 +28,9 @@ const api = vi.hoisted(() => ({
   add: vi.fn<typeof consoleClient.apps.byAppId.annotations.post>(),
   remove: vi.fn<typeof consoleClient.apps.byAppId.annotations.byAnnotationId.delete>(),
   batchRemove: vi.fn<typeof consoleClient.apps.byAppId.annotations.delete>(),
+  batchImport: vi.fn<typeof consoleClient.apps.byAppId.annotations.batchImport.post>(),
+  batchImportStatus:
+    vi.fn<typeof consoleClient.apps.byAppId.annotations.batchImportStatus.byJobId.get>(),
   edit: vi.fn<typeof consoleClient.apps.byAppId.annotations.byAnnotationId.post>(),
   config: vi.fn<typeof consoleClient.apps.byAppId.annotationSetting.get>(),
   status: vi.fn<typeof consoleClient.apps.byAppId.annotationReply.byAction.post>(),
@@ -52,7 +56,9 @@ vi.mock('@/service/console', async (importOriginal) => {
       'apps.byAppId.annotationSetting.get': (input) => api.config(input),
     }),
     consoleClient: withConsoleClientResponses(actual.consoleClient, {
-      'apps.byAppId.annotations.delete': (input) => api.batchRemove(input),
+      'apps.byAppId.annotations.batchImport.post': (input) => api.batchImport(input),
+      'apps.byAppId.annotations.batchImportStatus.byJobId.get': (input) =>
+        api.batchImportStatus(input),
       'apps.byAppId.annotations.byAnnotationId.hitHistories.get': () => ({
         data: [],
         total: 0,
@@ -323,6 +329,59 @@ it('shows the quota dialog without enabling annotated replies when the plan is f
   await user.click(within(dialog).getByRole('button', { name: 'common.operation.close' }))
   await waitFor(() => expect(dialog).not.toBeInTheDocument())
   expect(screen.getByRole('switch')).not.toBeChecked()
+})
+
+it('refreshes annotation quota after batch deleting annotations at the quota limit', async () => {
+  annotations = [item]
+  const queryClient = createConsoleQueryClient()
+  const user = setup({ size: 10, limit: 10 }, queryClient)
+  api.features.mockResolvedValue(
+    createFeaturesFixture({ annotation_quota_limit: { size: 9, limit: 10 } }),
+  )
+
+  await user.click(await screen.findByRole('checkbox', { name: 'Question 1' }))
+  await user.click(screen.getByRole('button', { name: 'common.operation.delete' }))
+  const confirmDialog = await screen.findByRole('alertdialog', {
+    name: 'appAnnotation.list.delete.title',
+  })
+  await user.click(within(confirmDialog).getByRole('button', { name: 'common.operation.delete' }))
+
+  await waitFor(() => expect(api.features).toHaveBeenCalledTimes(1))
+  await user.click(screen.getByRole('switch'))
+  expect(await screen.findByRole('dialog', { name: 'appAnnotation.initSetup.title' })).toBeVisible()
+})
+
+it('refreshes annotation quota after a CSV batch import completes', async () => {
+  const queryClient = createConsoleQueryClient()
+  const user = setup({ size: 9, limit: 10 }, queryClient)
+  api.batchImport.mockResolvedValue({ job_id: 'import-1', job_status: 'waiting' })
+  api.batchImportStatus.mockResolvedValue({
+    job_id: 'import-1',
+    job_status: 'completed',
+    error_msg: '',
+  })
+  api.features.mockResolvedValue(
+    createFeaturesFixture({ annotation_quota_limit: { size: 10, limit: 10 } }),
+  )
+
+  await user.click(await screen.findByRole('button', { name: 'common.operation.more' }))
+  await user.click(
+    await screen.findByRole('menuitem', { name: 'appAnnotation.table.header.bulkImport' }),
+  )
+  const dialog = await screen.findByRole('dialog', { name: 'appAnnotation.batchModal.title' })
+  const fileInput = dialog.querySelector('input[type="file"]') as HTMLInputElement
+  await user.upload(
+    fileInput,
+    new File(['q,a\nHello,World'], 'annotations.csv', { type: 'text/csv' }),
+  )
+  await user.click(within(dialog).getByRole('button', { name: 'appAnnotation.batchModal.run' }))
+
+  await waitFor(() => expect(dialog).not.toBeInTheDocument())
+  await waitFor(() => expect(api.features).toHaveBeenCalledTimes(1))
+  await waitFor(() => expect(queryClient.isFetching()).toBe(0))
+  await user.click(screen.getByRole('switch'))
+  expect(await screen.findByText('billing.annotatedResponse.fullTipLine1')).toBeVisible()
+  expect(api.status).not.toHaveBeenCalled()
 })
 
 it('disables annotated replies and reloads settings after the job completes', async () => {

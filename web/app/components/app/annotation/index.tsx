@@ -9,7 +9,7 @@ import { IconButton } from '@langgenius/dify-ui/icon-button'
 import { Pagination } from '@langgenius/dify-ui/pagination'
 import { Switch } from '@langgenius/dify-ui/switch'
 import { RiEqualizer2Line } from '@remixicon/react'
-import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useDebounce } from 'ahooks'
 import * as React from 'react'
 import { useEffect, useState } from 'react'
@@ -100,13 +100,23 @@ function Annotation({ appDetail }: AnnotationProps) {
   if (annotationPage && !isPlaceholderData && !isLoading && currPage + 1 > totalPages)
     setCurrPage(totalPages - 1)
 
-  // Bulk deletes and CSV imports have no cache policy, so the list and export are refreshed here.
-  const invalidateAnnotations = () =>
-    queryClient.invalidateQueries({
+  // CSV imports have no cache policy, so the list, export, and quota are refreshed here.
+  const invalidateAnnotations = () => {
+    void queryClient.invalidateQueries({
       queryKey: consoleQuery.apps.byAppId.annotations.key({
         input: { params: { app_id: appDetail.id } },
       }),
     })
+    void queryClient.invalidateQueries({
+      queryKey: consoleQuery.features.get.key(),
+    })
+  }
+
+  const { mutateAsync: batchDeleteAnnotations } = useMutation(
+    consoleQuery.apps.byAppId.annotations.delete.mutationOptions({
+      meta: { errorToast: false },
+    }),
+  )
 
   const ensureJobCompleted = async (jobId: string, status: AnnotationEnableStatus) => {
     while (true) {
@@ -123,11 +133,10 @@ function Annotation({ appDetail }: AnnotationProps) {
 
   const handleBatchDelete = async () => {
     try {
-      await consoleClient.apps.byAppId.annotations.delete({
+      await batchDeleteAnnotations({
         params: { app_id: appDetail.id },
         query: { annotation_id: selectedIds },
       })
-      void invalidateAnnotations()
       setSelectedIds([])
     } catch (e: any) {
       toast.error(e.message || t(($) => $['api.actionFailed'], { ns: 'common' }))
